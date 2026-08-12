@@ -152,6 +152,14 @@ struct ublk_shmem_buf_reg {
 #define	UBLK_U_IO_FETCH_IO_CMDS 	\
 	_IOWR('u', 0x27, struct ublk_batch_io)
 
+/*
+ * Atomically register all buffer pools for one queue
+ * (UBLK_F_BUF_RINGS).  ublksrv_io_cmd.q_id identifies the queue and
+ * ublksrv_io_cmd.addr points to struct ublk_buf_pools_config.
+ */
+#define	UBLK_U_IO_REGISTER_BUF_POOLS	\
+	_IOWR('u', 0x28, struct ublksrv_io_cmd)
+
 /* only ABORT means that no re-fetch */
 #define UBLK_IO_RES_OK			0
 #define UBLK_IO_RES_NEED_GET_DATA	1
@@ -401,6 +409,21 @@ struct ublk_shmem_buf_reg {
  * encodes the buffer index + offset instead of a userspace buffer address.
  */
 #define UBLK_F_SHMEM_ZC	(1ULL << 19)
+
+/*
+ * Enable multi-size buffer pools for copy mode. The server registers
+ * one buffer-pool set per queue via UBLK_U_IO_REGISTER_BUF_POOLS before
+ * the device is started.
+ * Kernel selects the smallest buffer that fits at dispatch time.
+ * Mutually exclusive with UBLK_F_NEED_GET_DATA.
+ */
+#define UBLK_F_BUF_RINGS	(1ULL << 20)
+
+/*
+ * Pin and vmap buffer pool memory at registration. Requires BUF_RINGS.
+ * Kernel uses memcpy via kaddr instead of copy_to_user/copy_from_user.
+ */
+#define UBLK_F_PINNED_BUFS	(1ULL << 21)
 
 /* device state */
 #define UBLK_S_DEV_DEAD	0
@@ -666,6 +689,31 @@ struct ublk_batch_io {
 	__u8	elem_bytes;
 	__u8	reserved;
 	__u64   reserved2;
+};
+
+#define UBLK_MAX_BUF_POOLS	8
+
+/* One tightly packed size tier in a buffer-pool arena. */
+struct ublk_buf_pool_desc {
+	__u64	offset;		/* byte offset from config.addr */
+	__u32	buf_size;	/* bytes per buffer */
+	__u32	nr_bufs;	/* number of buffers in this tier */
+};
+
+/*
+ * Payload for UBLK_U_IO_REGISTER_BUF_POOLS.
+ *
+ * pools[] entries are ordered by strictly increasing buf_size.  Their
+ * regions are tightly packed: pools[0].offset is zero, each following
+ * offset is the end of the previous tier, and the final end equals len.
+ */
+struct ublk_buf_pools_config {
+	__u64	addr;		/* page-aligned arena base */
+	__u64	len;		/* total arena size */
+	__u32	nr_pools;	/* number of valid pools[] entries */
+	__u32	flags;		/* reserved, must be 0 */
+	struct ublk_buf_pool_desc pools[UBLK_MAX_BUF_POOLS];
+	__u64	reserved[2];	/* must be 0 */
 };
 
 struct ublk_param_basic {
