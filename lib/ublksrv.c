@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT or LGPL-2.1-only
 
 #include <config.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -134,7 +135,7 @@ static void ublksrv_tgt_deinit(struct _ublksrv_dev *dev)
 
 static inline bool ublksrv_queue_alloc_buf(const struct _ublksrv_queue *q)
 {
-	return !(q->state & UBLKSRV_ZERO_COPY);
+	return !(q->state & (UBLKSRV_ZERO_COPY | UBLKSRV_BUF_RINGS));
 }
 
 static void ublk_set_auto_buf_reg(struct io_uring_sqe *sqe,
@@ -751,12 +752,18 @@ const struct ublksrv_queue *ublksrv_queue_init_flags(const struct ublksrv_dev *t
 		q->state |= UBLKSRV_QUEUE_POLL;
 	if (ctrl_dev->dev_info.flags & UBLK_F_BATCH_IO)
 		q->state |= UBLKSRV_QUEUE_BATCH_IO;
+	if (ctrl_dev->dev_info.flags & UBLK_F_BUF_RINGS)
+		q->state |= UBLKSRV_BUF_RINGS;
 	q->q_id = q_id;
 	/* FIXME: depth has to be PO 2 */
 	q->q_depth = depth;
 	q->io_cmd_buf = NULL;
 	q->cmd_inflight = 0;
 	q->tgt_io_inflight = 0;
+	q->tid = ublksrv_gettid();
+	q->buf_pool_reg_result = 0;
+	q->buf_pool_reg_pending = false;
+	q->buf_pool_reg_done = false;
 	q->cqe_dispatching = false;
 	q->tid = ublksrv_gettid();
 
@@ -899,6 +906,225 @@ const struct ublksrv_queue *ublksrv_queue_init(const struct ublksrv_dev *tdev,
 		unsigned short q_id, void *queue_data)
 {
 	return ublksrv_queue_init_flags(tdev, q_id, queue_data, IORING_SETUP_COOP_TASKRUN);
+}
+
+/* Registration is a setup-time command and has its own CQE identity. */
+#define UBLKSRV_REGISTER_BUF_POOLS_USERDATA	(~0ULL)
+
+static int ublksrv_reap_events_uring(struct io_uring *r);
+
+struct ublksrv_buf_pool_set {
+	void *addr;
+	size_t len;
+};
+
+static int ublksrv_validate_buf_pool_specs(
+		const struct _ublksrv_queue *q,
+		const struct ublksrv_buf_pool_spec *specs,
+		unsigned int nr_specs, size_t *len)
+{
+	size_t total = 0;
+	size_t total_bufs = 0;
+	long page_size = sysconf(_SC_PAGESIZE);
+	unsigned int i;
+
+	if (!q || !specs || !len || !nr_specs ||
+	    nr_specs > UBLK_MAX_BUF_POOLS || page_size <= 0)
+		return -EINVAL;
+
+	for (i = 0; i < nr_specs; i++) {
+		const struct ublksrv_buf_pool_spec *spec = &specs[i];
+		size_t tier_len;
+
+		if (!spec->buf_size ||
+		    spec->buf_size > (1U << UBLK_IO_BUF_BITS) ||
+		    spec->buf_size % page_size ||
+		    (spec->buf_size & (spec->buf_size - 1)) ||
+		    !spec->nr_bufs)
+			return -EINVAL;
+
+		if (total_bufs > (size_t)q->q_depth ||
+		    spec->nr_bufs > (size_t)q->q_depth - total_bufs)
+			return -EINVAL;
+		total_bufs += spec->nr_bufs;
+
+		if (i && spec->buf_size <= specs[i - 1].buf_size)
+			return -EINVAL;
+
+		if (spec->nr_bufs > (SIZE_MAX - total) / spec->buf_size)
+			return -EOVERFLOW;
+
+		tier_len = (size_t)spec->buf_size * spec->nr_bufs;
+		total += tier_len;
+	}
+
+	if (specs[nr_specs - 1].buf_size <
+	    q->dev->ctrl_dev->dev_info.max_io_buf_bytes)
+		return -EINVAL;
+
+	*len = total;
+	return 0;
+}
+
+int ublksrv_queue_register_buf_pools(const struct ublksrv_queue *tq,
+		void *addr, size_t len,
+		const struct ublksrv_buf_pool_spec *specs,
+		unsigned int nr_specs)
+{
+	struct _ublksrv_queue *q;
+	struct ublk_buf_pools_config cfg = { 0 };
+	struct ublksrv_io_cmd *cmd;
+	struct io_uring_sqe *sqe;
+	__u32 cmd_op = UBLK_U_IO_REGISTER_BUF_POOLS;
+	size_t expected_len;
+	long page_size;
+	unsigned int i;
+	int ret;
+
+	if (!tq)
+		return -EINVAL;
+
+	q = tq_to_local(tq);
+
+	if (!(q->state & UBLKSRV_BUF_RINGS))
+		return -EINVAL;
+	if (q->buf_pool_reg_pending || q->cqe_dispatching)
+		return -EBUSY;
+	if (q->buf_pool_reg_done)
+		return -EALREADY;
+
+	/*
+	 * This helper owns/reaps the queue ring synchronously and is setup-only.
+	 * The local dispatch guard rejects target-callback re-entry; callers must
+	 * still serialize START against setup, and the kernel atomically rejects a
+	 * first registration after the device becomes live.
+	 */
+	ret = ublksrv_validate_buf_pool_specs(q, specs, nr_specs,
+					       &expected_len);
+	if (ret)
+		return ret;
+
+	page_size = sysconf(_SC_PAGESIZE);
+	if (!addr || (uintptr_t)addr % page_size || len != expected_len)
+		return -EINVAL;
+
+	cfg.addr = (__u64)(uintptr_t)addr;
+	cfg.len = len;
+	cfg.nr_pools = nr_specs;
+	for (i = 0; i < nr_specs; i++) {
+		cfg.pools[i].offset = i ?
+			cfg.pools[i - 1].offset +
+			(__u64)cfg.pools[i - 1].buf_size *
+			cfg.pools[i - 1].nr_bufs : 0;
+		cfg.pools[i].buf_size = specs[i].buf_size;
+		cfg.pools[i].nr_bufs = specs[i].nr_bufs;
+	}
+
+	sqe = ublksrv_alloc_sqe(&q->ring);
+	if (!sqe)
+		return -ENOMEM;
+
+	cmd = (struct ublksrv_io_cmd *)ublksrv_get_sqe_cmd(sqe);
+	cmd->q_id = q->q_id;
+	cmd->tag = 0;
+	cmd->addr = (__u64)(uintptr_t)&cfg;
+	cmd->result = 0;
+
+	ublksrv_set_sqe_cmd_op(sqe, cmd_op);
+	sqe->fd = 0;
+	sqe->opcode = IORING_OP_URING_CMD;
+	sqe->flags = IOSQE_FIXED_FILE;
+	io_uring_sqe_set_data64(sqe, UBLKSRV_REGISTER_BUF_POOLS_USERDATA);
+
+	q->buf_pool_reg_result = -EINPROGRESS;
+	q->buf_pool_reg_pending = true;
+	do {
+		do {
+			ret = io_uring_submit_and_wait(&q->ring, 1);
+		} while (ret == -EINTR);
+		if (ret < 0) {
+			q->buf_pool_reg_pending = false;
+			return ret;
+		}
+
+		/*
+		 * Pre-START FETCH normally cannot complete. Still demultiplex the
+		 * whole batch so an external cancellation or setup CQE is never
+		 * consumed and lost as though it were our registration result.
+		 */
+		ublksrv_reap_events_uring(&q->ring);
+	} while (q->buf_pool_reg_pending);
+
+	ret = q->buf_pool_reg_result;
+	if (!ret)
+		q->buf_pool_reg_done = true;
+	return ret;
+}
+
+int ublksrv_queue_setup_buf_pools(const struct ublksrv_queue *tq,
+		const struct ublksrv_buf_pool_spec *specs,
+		unsigned int nr_specs, struct ublksrv_buf_pool_set **set_out)
+{
+	struct ublksrv_buf_pool_set *set;
+	struct _ublksrv_queue *q;
+	void *addr;
+	size_t len;
+	int ret;
+
+	if (!tq || !set_out)
+		return -EINVAL;
+
+	*set_out = NULL;
+	q = tq_to_local(tq);
+	if (!(q->state & UBLKSRV_BUF_RINGS))
+		return -EINVAL;
+
+	ret = ublksrv_validate_buf_pool_specs(q, specs, nr_specs, &len);
+	if (ret)
+		return ret;
+
+	set = calloc(1, sizeof(*set));
+	if (!set)
+		return -ENOMEM;
+
+	addr = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (addr == MAP_FAILED) {
+		ret = -errno;
+		free(set);
+		return ret;
+	}
+
+	/* Pinned registration expects every anonymous page to be present. */
+	if (q->dev->ctrl_dev->dev_info.flags & UBLK_F_PINNED_BUFS)
+		memset(addr, 0, len);
+
+#ifdef MADV_DONTDUMP
+	(void)madvise(addr, len, MADV_DONTDUMP);
+#endif
+
+	ret = ublksrv_queue_register_buf_pools(tq, addr, len, specs,
+						nr_specs);
+	if (ret) {
+		munmap(addr, len);
+		free(set);
+		return ret;
+	}
+
+	set->addr = addr;
+	set->len = len;
+	*set_out = set;
+	return 0;
+}
+
+void ublksrv_buf_pool_set_destroy(struct ublksrv_buf_pool_set *set)
+{
+	if (!set)
+		return;
+
+	if (set->addr)
+		munmap(set->addr, set->len);
+	free(set);
 }
 
 static int ublksrv_create_pid_file(struct _ublksrv_dev *dev)
@@ -1046,11 +1272,21 @@ static void ublksrv_handle_cqe(struct io_uring *r,
 		struct io_uring_cqe *cqe, void *data)
 {
 	struct _ublksrv_queue *q = container_of(r, struct _ublksrv_queue, ring);
-	unsigned tag = user_data_to_tag(cqe->user_data);
-	unsigned cmd_op = user_data_to_op(cqe->user_data);
-	int fetch = (cqe->res != UBLK_IO_RES_ABORT) &&
-		!(q->state & UBLKSRV_QUEUE_STOPPING);
+	unsigned tag;
+	unsigned cmd_op;
+	int fetch;
 	struct ublk_io *io;
+
+	if (cqe->user_data == UBLKSRV_REGISTER_BUF_POOLS_USERDATA) {
+		q->buf_pool_reg_result = cqe->res;
+		q->buf_pool_reg_pending = false;
+		return;
+	}
+
+	tag = user_data_to_tag(cqe->user_data);
+	cmd_op = user_data_to_op(cqe->user_data);
+	fetch = (cqe->res != UBLK_IO_RES_ABORT) &&
+		!(q->state & UBLKSRV_QUEUE_STOPPING);
 
 	ublk_dbg(UBLK_DBG_IO_CMD, "%s: res %d (qid %d tag %u cmd_op %u target %d/%x event %d) stopping %d\n",
 			__func__, cqe->res, q->q_id, tag, cmd_op,
@@ -1312,6 +1548,24 @@ void *ublksrv_queue_get_io_buf(const struct ublksrv_queue *tq, int tag)
 	if (tag < q->q_depth)
 		return q->ios[tag].buf_addr;
 	return NULL;
+}
+
+void *ublksrv_io_get_buf(const struct ublksrv_queue *tq,
+			 const struct ublk_io_data *data)
+{
+	const struct _ublksrv_queue *q;
+
+	if (!tq || !data || !data->iod || data->tag < 0)
+		return NULL;
+
+	q = tq_to_local(tq);
+	if (data->tag >= q->q_depth)
+		return NULL;
+
+	if (q->state & UBLKSRV_BUF_RINGS)
+		return (void *)(uintptr_t)data->iod->addr;
+
+	return q->ios[data->tag].buf_addr;
 }
 
 /*

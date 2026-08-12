@@ -104,6 +104,18 @@ struct ublk_io_data {
 	void *private_data;
 };
 
+/** One userspace buffer-pool size tier. */
+struct ublksrv_buf_pool_spec {
+	/** Size in bytes of each buffer. */
+	unsigned int buf_size;
+
+	/** Number of buffers in this tier. */
+	unsigned int nr_bufs;
+};
+
+/* Opaque handle returned by ublksrv_queue_setup_buf_pools(). */
+struct ublksrv_buf_pool_set;
+
 /* queue state is only retrieved via ublksrv_queue_state() API */
 #define UBLKSRV_QUEUE_STOPPING	(1U << 0)
 #define UBLKSRV_QUEUE_IDLE	(1U << 1)
@@ -113,6 +125,7 @@ struct ublk_io_data {
 #define UBLKSRV_AUTO_ZC 	(1U << 5)
 #define UBLKSRV_QUEUE_POLL	(1U << 6)
 #define UBLKSRV_QUEUE_BATCH_IO	(1U << 7)
+#define UBLKSRV_BUF_RINGS	(1U << 8)
 
 /**
  * ublksrv_queue is 1:1 mapping with ublk driver's blk-mq queue, and
@@ -1098,6 +1111,21 @@ extern const struct ublk_io_data *ublksrv_queue_get_io_data(
 extern void *ublksrv_queue_get_io_buf(const struct ublksrv_queue *q, int tag);
 
 /**
+ * Return the payload buffer for an IO.
+ *
+ * This helper covers both the traditional per-tag buffer mode and
+ * UBLK_F_BUF_RINGS.  In buffer-pool mode the kernel-selected pointer is
+ * read from data->iod->addr.  The returned pointer is valid only until the
+ * IO is passed to ublksrv_complete_io().
+ *
+ * @param q the ublksrv queue instance
+ * @param data IO data delivered to the target
+ * @return payload buffer, or NULL for invalid input/non-buffer modes
+ */
+extern void *ublksrv_io_get_buf(const struct ublksrv_queue *q,
+				const struct ublk_io_data *data);
+
+/**
  * Return current queue state
  *
  * queue state is usually for debug purpose
@@ -1143,6 +1171,59 @@ extern const struct ublksrv_queue *ublksrv_queue_init_flags(const struct ublksrv
  * @param q the ublksrv queue instance
  */
 extern void ublksrv_queue_deinit(const struct ublksrv_queue *q);
+
+/**
+ * Atomically register a caller-owned buffer-pool arena with the kernel.
+ *
+ * @addr must point to a writable, page-aligned mapping of exactly @len
+ * bytes.  @specs must be ordered by strictly increasing buffer size.  The
+ * sizes must be page-aligned powers of two and each count must be nonzero;
+ * their total count must not exceed the queue depth.  The library tightly
+ * packs the tiers in the supplied arena.  The largest tier must cover the
+ * device's max_io_buf_bytes.  The caller owns the mapping and must keep it
+ * valid until the queue has stopped and the kernel can no longer access its
+ * buffers.
+ *
+ * This function is synchronous and must be called by the queue thread after
+ * ublksrv_queue_init() and before the device is started.  No CQEs other than
+ * the queue's parked FETCH_REQ commands may be pending while it runs.
+ *
+ * @param q the ublksrv queue instance (UBLK_F_BUF_RINGS required)
+ * @param addr base address of the arena
+ * @param len exact arena length
+ * @param specs ordered size-tier specifications
+ * @param nr_specs number of specifications
+ * @return 0 on success, negative errno on failure
+ */
+extern int ublksrv_queue_register_buf_pools(
+		const struct ublksrv_queue *q, void *addr, size_t len,
+		const struct ublksrv_buf_pool_spec *specs,
+		unsigned int nr_specs);
+
+/**
+ * Allocate, populate, and register an anonymous buffer-pool arena.
+ *
+ * The returned pool set owns its mmap allocation.  Destroy it only after the
+ * queue has stopped and been deinitialized; destroying it earlier invalidates
+ * iod->addr pointers that may still be in use.
+ *
+ * @param q the ublksrv queue instance
+ * @param specs ordered size-tier specifications
+ * @param nr_specs number of specifications
+ * @param set_out receives the allocated pool-set handle
+ * @return 0 on success, negative errno on failure
+ */
+extern int ublksrv_queue_setup_buf_pools(
+		const struct ublksrv_queue *q,
+		const struct ublksrv_buf_pool_spec *specs,
+		unsigned int nr_specs,
+		struct ublksrv_buf_pool_set **set_out);
+
+/**
+ * Release an anonymous arena returned by ublksrv_queue_setup_buf_pools().
+ * Call only after the queue has stopped and been deinitialized.
+ */
+extern void ublksrv_buf_pool_set_destroy(struct ublksrv_buf_pool_set *set);
 
 /**
  * Return how many unconsumed cqes in CQ of queue uring

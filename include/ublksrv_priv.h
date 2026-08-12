@@ -177,6 +177,9 @@ struct _ublksrv_queue {
 
 	unsigned cmd_inflight, tgt_io_inflight;	//obsolete
 	unsigned state;
+	int buf_pool_reg_result;
+	bool buf_pool_reg_pending;
+	bool buf_pool_reg_done;
 	bool cqe_dispatching;
 
 	int epollfd;
@@ -285,10 +288,11 @@ int create_pid_file(const char *pid_file, int *pid_fd);
 
 extern void ublksrv_build_cpu_str(char *buf, int len, const cpu_set_t *cpuset);
 
-/* Check if queue needs to pass buffer addresses (not zero-copy or user-copy) */
+/* Check if queue needs to pass buffer addresses (not zero-copy, user-copy, or buf_rings) */
 static inline bool ublksrv_queue_use_buf(const struct _ublksrv_queue *q)
 {
-	return !(q->state & (UBLKSRV_USER_COPY | UBLKSRV_ZERO_COPY));
+	return !(q->state & (UBLKSRV_USER_COPY | UBLKSRV_ZERO_COPY |
+			     UBLKSRV_BUF_RINGS));
 }
 
 /* Batch IO support - check if queue uses batch mode */
